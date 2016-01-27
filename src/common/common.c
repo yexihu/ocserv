@@ -1,6 +1,6 @@
 /*
- * Copyright (C) 2013-2015 Nikos Mavrogiannopoulos
- * Copyright (C) 2015 Red Hat, Inc.
+ * Copyright (C) 2013-2016 Nikos Mavrogiannopoulos
+ * Copyright (C) 2016 Red Hat, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -29,6 +29,7 @@
 /* for recvmsg */
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <poll.h>
 
 #include "common.h"
 
@@ -170,22 +171,19 @@ uint8_t * p = buf;
 
 ssize_t force_read_timeout(int sockfd, void *buf, size_t len, unsigned sec)
 {
-int left = len;
-int ret;
-uint8_t * p = buf;
-struct timeval tv;
-fd_set set;
+    int left = len;
+    int ret;
+    uint8_t * p = buf;
+    struct pollfd pfd;
 
 	while(left > 0) {
 		if (sec > 0) {
-			tv.tv_sec = sec;
-			tv.tv_usec = 0;
-
-			FD_ZERO(&set);
-			FD_SET(sockfd, &set);
+            pfd.fd = sockfd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
 
 			do {
-				ret = select(sockfd + 1, &set, NULL, NULL, &tv);
+				ret = poll(&pfd, 1, sec*1000);
 			} while (ret == -1 && errno == EINTR);
 
 			if (ret == -1 || ret == 0) {
