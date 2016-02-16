@@ -49,15 +49,20 @@ gnutls_cipher_hd_t h;
 uint8_t *p, *decrypted = NULL;
 unsigned p_size;
 
-	if (cookie_size <= COOKIE_IV_SIZE+COOKIE_MAC_SIZE)
+	if (cookie_size <= COOKIE_IV_SIZE+COOKIE_MAC_SIZE) {
+		syslog(LOG_ERR, "cookies: the cookie size is invalid");
 		return -1;
+	}
 
 	ret = gnutls_cipher_init(&h, GNUTLS_CIPHER_AES_128_GCM, key, &iv);
-	if (ret < 0)
+	if (ret < 0) {
+		syslog(LOG_ERR, "cookies: could not initialize AES-GCM");
 		return -1;
+	}
 
 	decrypted = talloc_size(pa->allocator_data, cookie_size);
 	if (decrypted == NULL) {
+		syslog(LOG_ERR, "cookies: could not allocated data");
 		ret = -1;
 		goto cleanup;
 	}
@@ -67,6 +72,7 @@ unsigned p_size;
 
 	ret = gnutls_cipher_decrypt2(h, cookie, cookie_size, decrypted, cookie_size);
 	if (ret < 0) {
+		syslog(LOG_ERR, "cookies: could not decrypt cookie");
 		ret = -1;
 		goto cleanup;
 	}
@@ -76,11 +82,13 @@ unsigned p_size;
 
 	ret = gnutls_cipher_tag(h, tag, sizeof(tag));
 	if (ret < 0) {
+		syslog(LOG_ERR, "cookies: could not get the tag of the cookie");
 		ret = -1;
 		goto cleanup;
 	}
 
 	if (memcmp(tag, cookie+cookie_size, COOKIE_MAC_SIZE) != 0) {
+		syslog(LOG_ERR, "cookies: could not verify the tag of the cookie");
 		ret = -1;
 		goto cleanup;
 	}
@@ -88,6 +96,7 @@ unsigned p_size;
 	/* unpack */
 	*msg = cookie__unpack(pa, p_size, p);
 	if (*msg == NULL) {
+		syslog(LOG_ERR, "cookies: could not unpack the cookie");
 		ret = -1;
 		goto cleanup;
 	}
