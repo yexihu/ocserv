@@ -50,6 +50,7 @@ enum {
 	HEADER_COOKIE = 1,
 	HEADER_MASTER_SECRET,
 	HEADER_HOSTNAME,
+	HEADER_CSTP_MTU,
 	HEADER_CSTP_BASE_MTU,
 	HEADER_CSTP_ATYPE,
 	HEADER_DEVICE_TYPE,
@@ -138,6 +139,7 @@ struct http_req_st {
 	unsigned int headers_complete;
 	unsigned int message_complete;
 	unsigned base_mtu;
+	unsigned cstp_mtu;
 	
 	unsigned no_ipv4;
 	unsigned no_ipv6;
@@ -225,12 +227,18 @@ typedef struct worker_st {
 	bandwidth_st b_rx;
 
 	/* ws->conn_mtu: The MTU of the plaintext data we can send to the client.
-	 *  It also matches the MTU of the TUN device. Note that this is
-	 *  the same as the 'real' MTU of the connection, minus the IP+UDP+CSTP headers
+	 *  It also matches the MTU of the TUN device (that's why we have a single
+	 *  value instead of separate for CSTP/DTLS). Note that this is the same
+	 *  as the 'real' or 'base' MTU of the connection, minus the IP+UDP
 	 *  and the DTLS crypto overhead. */
 	unsigned conn_mtu;
-	unsigned crypto_overhead; /* estimated overhead of DTLS ciphersuite + DTLS CSTP HEADER */
-	unsigned proto_overhead; /* UDP + IP header size */
+	unsigned adv_mtu; /* the MTU advertized on connection setup */
+
+	unsigned cstp_crypto_overhead; /* estimated overhead of DTLS ciphersuite + DTLS CSTP HEADER */
+	unsigned cstp_proto_overhead; /* UDP + IP header size */
+
+	unsigned dtls_crypto_overhead; /* estimated overhead of DTLS ciphersuite + DTLS CSTP HEADER */
+	unsigned dtls_proto_overhead; /* UDP + IP header size */
 	
 	/* Indicates whether the new IPv6 headers will
 	 * be sent or the old */
@@ -278,8 +286,7 @@ typedef struct worker_st {
 } worker_st;
 
 #define RESET_DTLS_MTU(ws) \
-		ws->conn_mtu = MIN(ws->conn_mtu, \
-			ws->vinfo.mtu - ws->proto_overhead - ws->crypto_overhead)
+		ws->conn_mtu = (ws->vinfo.mtu - ws->dtls_proto_overhead - ws->dtls_crypto_overhead)
 
 void vpn_server(struct worker_st* ws);
 

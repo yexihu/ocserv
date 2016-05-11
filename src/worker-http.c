@@ -343,6 +343,9 @@ void header_value_check(struct worker_st *ws, struct http_req_st *req)
 	case HEADER_CSTP_BASE_MTU:
 		req->base_mtu = atoi((char *)value);
 		break;
+	case HEADER_CSTP_MTU:
+		req->cstp_mtu = atoi((char *)value);
+		break;
 	case HEADER_CSTP_ATYPE:
 		if (memmem(value, value_length, "IPv4", 4) == NULL)
 			req->no_ipv4 = 1;

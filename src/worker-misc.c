@@ -128,7 +128,6 @@ int handle_commands_from_main(struct worker_st *ws)
 			}
 
 			set_non_block(fd);
-
 			if (has_hello == 0) {
 				/* check if the first packet received is a valid one -
 				 * if not discard the new fd */
@@ -151,6 +150,9 @@ int handle_commands_from_main(struct worker_st *ws)
 
 			ws->dtls_tptr.msg = tmsg;
 			ws->dtls_tptr.fd = fd;
+
+			if (ws->config->try_mtu == 0)
+				set_mtu_disc(fd, ws->proto, 0);
 
 			oclog(ws, LOG_DEBUG, "received new UDP fd and connected to peer");
 			return 0;

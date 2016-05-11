@@ -59,7 +59,7 @@
 
 #include <http_parser.h>
 
-#define MIN_MTU(ws) (((ws)->vinfo.ipv6!=NULL)?1281:576)
+#define MIN_MTU (1280)
 
 #define PERIODIC_CHECK_TIME 30
 #define MIN_STATS_INTERVAL 10
@@ -672,6 +672,13 @@ void session_info_send(worker_st * ws)
 	gnutls_free(msg.dtls_ciphersuite);
 }
 
+static void disable_mtu_disc(worker_st *ws)
+{
+	oclog(ws, LOG_DEBUG, "disabling MTU discovery on UDP socket");
+	set_mtu_disc(ws->dtls_tptr.fd, ws->proto, 0);
+	ws->config->try_mtu = 0;
+}
+
 /* mtu_set: Sets the MTU for the session
  *
  * @ws: a worker structure
@@ -682,6 +689,7 @@ void mtu_set(worker_st * ws, unsigned mtu)
 {
 	ws->conn_mtu = mtu;
 
+	oclog(ws, LOG_DEBUG, "setting connection MTU to %u", mtu);
 	if (ws->dtls_session)
 		gnutls_dtls_set_data_mtu(ws->dtls_session,
 					 ws->conn_mtu + CSTP_DTLS_OVERHEAD);
@@ -697,17 +705,20 @@ void mtu_set(worker_st * ws, unsigned mtu)
 static
 int mtu_not_ok(worker_st * ws)
 {
+	if (ws->config->try_mtu == 0 || ws->dtls_session == NULL)
+		return 0;
+
 	if (ws->proto == AF_INET) {
-		unsigned min = MIN_MTU(ws);
+		const unsigned min = MIN_MTU;
 
 		ws->last_bad_mtu = ws->conn_mtu;
 
 		if (ws->last_good_mtu == min) {
 			oclog(ws, LOG_INFO,
-			      "could not calculate a sufficient MTU; disabling DTLS");
-			dtls_close(ws);
-			ws->udp_state = UP_DISABLED;
-			return -1;
+			      "could not calculate a sufficient MTU; disabling MTU discovery");
+			disable_mtu_disc(ws);
+			mtu_set(ws, min);
+			return 0;
 		}
 
 		if (ws->last_good_mtu >= ws->conn_mtu) {
@@ -718,39 +729,36 @@ int mtu_not_ok(worker_st * ws)
 		oclog(ws, LOG_INFO, "MTU %u is too large, switching to %u",
 		      ws->last_bad_mtu, ws->conn_mtu);
 	} else if (ws->proto == AF_INET6) { /* IPv6 */
-		int mtu;
 #ifdef IPV6_PATHMTU
+		int mtu;
 		struct ip6_mtuinfo mtuinfo;
 		socklen_t len = sizeof(mtuinfo);
 
 		if (getsockopt(ws->dtls_tptr.fd, IPPROTO_IPV6, IPV6_PATHMTU, &mtuinfo, &len) < 0 || mtuinfo.ip6m_mtu < 1280) {
-			oclog(ws, LOG_INFO, "cannot obtain IPv6 MTU (was %u); disabling DTLS",
+			oclog(ws, LOG_INFO, "cannot obtain IPv6 MTU (was %u); disabling MTU discovery",
 			      ws->conn_mtu);
-			dtls_close(ws);
-			ws->udp_state = UP_DISABLED;
-			return -1;
+			disable_mtu_disc(ws);
+			mtu_set(ws, MIN_MTU);
+			return 0;
 		}
-		mtu = mtuinfo.ip6m_mtu;
+		mtu = mtuinfo.ip6m_mtu - ws->dtls_crypto_overhead - ws->dtls_proto_overhead;
+
+		gnutls_dtls_set_mtu(ws->dtls_session, mtu);
+		mtu = gnutls_dtls_get_data_mtu(ws->dtls_session);
+
+		if (mtu > ws->adv_mtu) {
+			oclog(ws, LOG_INFO, "the discovered IPv6 MTU is larger than the advertised (was %u, new %d); disabling MTU discovery",
+			      ws->adv_mtu, mtu);
+			disable_mtu_disc(ws);
+			return 0;
+		}
+		ws->conn_mtu = mtu;
+		oclog(ws, LOG_DEBUG, "setting (via IPV6_PATHMTU) connection MTU to %u", mtu);
+		mtu_send(ws, ws->conn_mtu);
 #else
-		mtu = 1280; /* minimum IPv6 MTU */
+		/* ensure we can transport IPv6 packets */
+		mtu_set(ws, MIN_MTU);
 #endif
-
-		mtu -= CSTP_DTLS_OVERHEAD - ws->proto_overhead;
-
-		if (ws->dtls_session) {
-			gnutls_dtls_set_mtu(ws->dtls_session, mtu);
-			mtu = gnutls_dtls_get_data_mtu(ws->dtls_session);
-
-			if (mtu >= ws->conn_mtu) {
-				oclog(ws, LOG_INFO, "the provided IPv6 MTU is larger than the used (was %u, new %d); disabling DTLS",
-				      ws->conn_mtu, mtu);
-				dtls_close(ws);
-				ws->udp_state = UP_DISABLED;
-				return -1;
-			}
-			ws->conn_mtu = mtu;
-			mtu_send(ws, ws->conn_mtu);
-		}
 	}
 
 	return 0;
@@ -772,7 +780,7 @@ void mtu_ok(worker_st * ws)
 {
 	unsigned int c;
 
-	if (ws->proto == AF_INET6)
+	if (ws->config->try_mtu == 0 || ws->proto == AF_INET6)
 		return;
 
 	if (ws->last_bad_mtu == (ws->conn_mtu) + 1 ||
@@ -793,8 +801,7 @@ void mtu_ok(worker_st * ws)
 		}
 
 static
-int periodic_check(worker_st * ws, unsigned mtu_overhead, struct timespec *tnow,
-		   unsigned dpd)
+int periodic_check(worker_st * ws, struct timespec *tnow, unsigned dpd)
 {
 	socklen_t sl;
 	int max, e, ret;
@@ -883,7 +890,7 @@ int periodic_check(worker_st * ws, unsigned mtu_overhead, struct timespec *tnow,
 		}
 	}
 
-	if (ws->conn_type != SOCK_TYPE_UNIX) {
+	if (ws->conn_type != SOCK_TYPE_UNIX && ws->udp_state != UP_DISABLED) {
 		sl = sizeof(max);
 		ret = getsockopt(ws->conn_fd, IPPROTO_TCP, TCP_MAXSEG, &max, &sl);
 		if (ret == -1) {
@@ -891,6 +898,7 @@ int periodic_check(worker_st * ws, unsigned mtu_overhead, struct timespec *tnow,
 			oclog(ws, LOG_INFO, "error in getting TCP_MAXSEG: %s",
 			      strerror(e));
 		} else {
+			unsigned mtu_overhead = ws->dtls_proto_overhead + ws->dtls_crypto_overhead;
 			max -= 13;
 			/*oclog(ws, LOG_DEBUG, "TCP MSS is %u", max); */
 			if (max > 0 && max - mtu_overhead < ws->conn_mtu) {
@@ -1022,8 +1030,7 @@ static int dtls_mainloop(worker_st * ws, struct timespec *tnow)
 			goto cleanup;
 		}
 
-		gnutls_dtls_set_mtu(ws->dtls_session,
-				    ws->conn_mtu + ws->crypto_overhead);
+		gnutls_dtls_set_data_mtu(ws->dtls_session, ws->conn_mtu+CSTP_DTLS_OVERHEAD);
 		mtu_discovery_init(ws, ws->conn_mtu);
 		break;
 
@@ -1340,6 +1347,58 @@ static void set_socket_timeout(worker_st * ws, int fd)
 	}
 }
 
+/* Calculate MTU for CSTP and DTLS channels.
+ */
+static void calc_mtu_values(worker_st * ws)
+{
+	/* assume that if IPv6 is used over TCP then the same would be used over UDP */
+	if (ws->proto == AF_INET) {
+		ws->cstp_proto_overhead = 20;	/* ip */
+		ws->dtls_proto_overhead = 20;	/* ip */
+	} else {
+		ws->cstp_proto_overhead = 40;	/* ipv6 */
+		ws->dtls_proto_overhead = 40;	/* ipv6 */
+	}
+	ws->cstp_proto_overhead += 20;	/* tcp */
+	ws->dtls_proto_overhead += 8;	/* udp */
+
+	if (ws->session == NULL) {
+		/* wild guess */
+		ws->cstp_crypto_overhead = CSTP_OVERHEAD +
+			tls_get_overhead(GNUTLS_TLS1_0, GNUTLS_CIPHER_AES_128_CBC, GNUTLS_MAC_SHA1);
+	} else {
+		ws->cstp_crypto_overhead = CSTP_OVERHEAD +
+		    tls_get_overhead(gnutls_protocol_get_version(ws->session),
+				     gnutls_cipher_get(ws->session),
+				     gnutls_mac_get(ws->session));
+	}
+
+	/* data MTU is the device (base) MTU minus the overhead
+	 * of the crypto and the CSTP protocols. */
+	ws->conn_mtu = ws->vinfo.mtu - ws->cstp_crypto_overhead - ws->cstp_proto_overhead;
+
+	if (ws->udp_state != UP_DISABLED) {
+		/* crypto overhead for DTLS */
+		ws->dtls_crypto_overhead =
+		    tls_get_overhead(ws->req.
+				     selected_ciphersuite->gnutls_version,
+				     ws->req.
+				     selected_ciphersuite->gnutls_cipher,
+				     ws->req.selected_ciphersuite->gnutls_mac);
+		ws->dtls_crypto_overhead += CSTP_DTLS_OVERHEAD;
+
+		oclog(ws, LOG_DEBUG,
+		      "DTLS overhead is %u",
+		      ws->dtls_proto_overhead + ws->dtls_crypto_overhead);
+
+		/* Set the connection MTU to be the DTLS one */
+		RESET_DTLS_MTU(ws);
+	}
+
+	/* This is the data MTU we advertised to peer, we will never exceed this value */
+	ws->adv_mtu = ws->conn_mtu;
+}
+
 /* connect_handler:
  * @ws: an initialized worker structure
  *
@@ -1453,6 +1512,7 @@ static int connect_handler(worker_st * ws)
 
 	/* calculate base MTU */
 	if (ws->user_config->mtu > 0) {
+		oclog(ws, LOG_INFO, "configured base MTU is %u", ws->user_config->mtu);
 		ws->vinfo.mtu = ws->user_config->mtu;
 	}
 
@@ -1478,25 +1538,13 @@ static int connect_handler(worker_st * ws)
 		}
 	}
 
-	ret = cstp_printf(ws, "X-CSTP-Base-MTU: %u\r\n", ws->vinfo.mtu);
-	SEND_ERR(ret);
-	oclog(ws, LOG_INFO, "CSTP Base MTU is %u bytes", ws->vinfo.mtu);
+	calc_mtu_values(ws);
 
-	/* calculate TLS channel MTU */
-	if (ws->session == NULL) {
-		/* wild guess */
-		ws->crypto_overhead = CSTP_OVERHEAD +
-			tls_get_overhead(GNUTLS_TLS1_0, GNUTLS_CIPHER_AES_128_CBC, GNUTLS_MAC_SHA1);
-	} else {
-		ws->crypto_overhead = CSTP_OVERHEAD +
-		    tls_get_overhead(gnutls_protocol_get_version(ws->session),
-				     gnutls_cipher_get(ws->session),
-				     gnutls_mac_get(ws->session));
+	if (req->cstp_mtu > 0 && req->base_mtu == 0) {
+		ws->vinfo.mtu = MIN(ws->vinfo.mtu, req->cstp_mtu + ws->dtls_proto_overhead + ws->dtls_crypto_overhead);
+		oclog(ws, LOG_INFO, "peer's CSTP MTU is %u / base is %u", req->cstp_mtu, ws->vinfo.mtu);
 	}
 
-	/* plaintext MTU is the device MTU minus the overhead
-	 * of the CSTP protocol. */
-	ws->conn_mtu = ws->vinfo.mtu - ws->crypto_overhead;
 	if (ws->conn_mtu < 1280 && ws->vinfo.ipv6 && req->no_ipv6 == 0) {
 		oclog(ws, LOG_INFO, "Connection MTU (%d) is not sufficient for IPv6 (1280)", ws->conn_mtu);
 		req->no_ipv6 = 1;
@@ -1709,7 +1757,9 @@ static int connect_handler(worker_st * ws)
 
 	/* set TCP socket options */
 	if (ws->config->output_buffer > 0) {
-		t = ws->conn_mtu * ws->config->output_buffer;
+		t = MAX(ws->conn_mtu, ws->conn_mtu);
+		t *= ws->config->output_buffer;
+
 		ret =
 		    setsockopt(ws->conn_fd, SOL_SOCKET, SO_SNDBUF, &t,
 			       sizeof(t));
@@ -1773,31 +1823,7 @@ static int connect_handler(worker_st * ws)
 			       ws->req.selected_ciphersuite->oc_name);
 		SEND_ERR(ret);
 
-		/* assume that if IPv6 is used over TCP then the same would be used over UDP */
-		if (ws->proto == AF_INET)
-			ws->proto_overhead = 20;	/* ip */
-		else
-			ws->proto_overhead = 40;	/* ipv6 */
-		ws->proto_overhead += 8;	/* udp */
-
-		/* crypto overhead for DTLS */
-		ws->crypto_overhead =
-		    tls_get_overhead(ws->req.
-				     selected_ciphersuite->gnutls_version,
-				     ws->req.
-				     selected_ciphersuite->gnutls_cipher,
-				     ws->req.selected_ciphersuite->gnutls_mac);
-		ws->crypto_overhead += CSTP_DTLS_OVERHEAD;
-
-		oclog(ws, LOG_DEBUG,
-		      "DTLS overhead is %u",
-		      ws->proto_overhead + ws->crypto_overhead);
-
-		/* plaintext MTU is the device MTU minus the overhead
-		 * of the DTLS (+AnyConnect header) protocol.
-		 */
 		RESET_DTLS_MTU(ws);
-
 		ret =
 		    cstp_printf(ws, "X-DTLS-MTU: %u\r\n", ws->conn_mtu);
 		SEND_ERR(ret);
@@ -1805,10 +1831,15 @@ static int connect_handler(worker_st * ws)
 	}
 
 	/* hack for openconnect. It uses only a single MTU value */
+	ret = cstp_printf(ws, "X-CSTP-Base-MTU: %u\r\n", ws->vinfo.mtu);
+	SEND_ERR(ret);
+	oclog(ws, LOG_INFO, "CSTP Base MTU is %u bytes", ws->vinfo.mtu);
+
 	ret = cstp_printf(ws, "X-CSTP-MTU: %u\r\n", ws->conn_mtu);
 	SEND_ERR(ret);
 
-	if (ws->buffer_size <= ws->conn_mtu + CSTP_OVERHEAD) {
+	if ((ws->buffer_size <= ws->conn_mtu + CSTP_OVERHEAD) ||
+	    (ws->buffer_size <= ws->conn_mtu + CSTP_DTLS_OVERHEAD)) {
 		oclog(ws, LOG_ERR,
 		      "buffer size is smaller than MTU (%u < %u)",
 		      ws->buffer_size, ws->conn_mtu);
@@ -1930,9 +1961,7 @@ static int connect_handler(worker_st * ws)
 		}
 		gettime(&tnow);
 
-		if (periodic_check
-		    (ws, ws->proto_overhead + ws->crypto_overhead, &tnow,
-		     ws->user_config->dpd) < 0) {
+		if (periodic_check(ws, &tnow, ws->user_config->dpd) < 0) {
 			terminate_reason = REASON_ERROR;
 			goto exit;
 		}
